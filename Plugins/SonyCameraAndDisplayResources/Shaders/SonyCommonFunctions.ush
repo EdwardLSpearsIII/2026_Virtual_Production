@@ -1,0 +1,50 @@
+
+// Copyright 2024 Sony Corporation
+
+
+float4 TetrahedralLUTInterpolation(float4 InputColor, Texture3D	lutTexture)
+{
+	float4 lutPixelPos = saturate(InputColor) * (LutNumPositionsPerChannel - 1);
+	float4 nearestLutPos = trunc(lutPixelPos);
+	int4 nearestLutPosInt = int4(nearestLutPos);
+	nearestLutPosInt.w = 0;
+	float4 fracLutPos = lutPixelPos - nearestLutPos;
+
+	float4 outputPixel = lutTexture.Load(nearestLutPosInt);
+	if(length(fracLutPos.xyz) == 0.0f)
+	{
+		return outputPixel;
+	}
+	for(uint i=0; i<LUT_NUM_TETRAHEDRONS; i++)
+	{
+		float4 lambda = mul(LutTetrahedralMatrices[i], fracLutPos);
+		if(all(step(0.0f, lambda.xyz)) && all(step(lambda.xyz, 1.0f)))  // all lambda.xyz between 0 and 1, so in this tetrahedron
+		{
+			outputPixel = (1.0f - lambda.x - lambda.y - lambda.z) * lutTexture.Load(nearestLutPosInt);
+			outputPixel += lambda.x * lutTexture.Load(nearestLutPosInt + LutTetrahedralCoords[2*i]);
+			outputPixel += lambda.y * lutTexture.Load(nearestLutPosInt + LutTetrahedralCoords[2*i + 1]);
+			outputPixel += lambda.z * lutTexture.Load(nearestLutPosInt + int4(1, 1, 1, 0));
+			return outputPixel;
+		}
+	}
+
+	return outputPixel; // shouldn't hit this, but just in case!
+}
+
+float4 Apply3DLUT(float4 InputColor, float bypass, float interp, Texture3D lutTexture, SamplerState lutSampler)
+{
+    InputColor = clamp(InputColor, 0.0f, 1.0f);
+	if(bypass > 0.5f) // bypass
+	{
+		return InputColor;
+	}
+    else if (interp > 0.5f) // apply LUT, tetrahedral interp
+	{
+		return TetrahedralLUTInterpolation(InputColor, lutTexture);
+	}
+	else // apply LUT, trilinear interp
+	{
+        return lutTexture.Sample(lutSampler, LUTScale * InputColor.xyz + LUTOffset);
+    }
+}
+

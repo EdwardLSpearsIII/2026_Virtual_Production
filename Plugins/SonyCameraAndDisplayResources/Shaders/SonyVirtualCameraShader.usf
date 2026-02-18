@@ -1,0 +1,243 @@
+/*=============================================================================
+ Copyright 2024 Sony Corporation
+ SonyVirtualCameraShader.usf: Pixel shader to apply Virtual Camera signal processing functions
+ =============================================================================*/
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+
+
+/* Declaration of all variables
+=============================================================================*/
+Texture2D      InputTexture;
+SamplerState   InputTextureSampler;
+Texture3D      PreNoiseLutTexture;
+SamplerState   PreNoiseLutTextureSampler;
+Texture3D      PostNoiseLutTexture;
+SamplerState   PostNoiseLutTextureSampler;
+Texture2D      LensTexture;
+SamplerState   LensTextureSampler;
+Texture2D      NoiseTexture;
+SamplerState   NoiseTextureSampler;
+Texture2D      ViewfinderGraphicsTexture;
+SamplerState   ViewfinderGraphicsTextureSampler;
+Texture2D      LogoTexture;
+SamplerState   LogoTextureSampler;
+Texture2D      ELZoneTextureSP;
+int3           ViewportSize;
+float          SensorHeightmm;
+float          SensorMaxRadiusmm;
+
+float          LUTOffset;
+float          LUTScale;
+
+#define LUT_NUM_TETRAHEDRONS 6
+int4           LutNumPositionsPerChannel;
+int4           LutTetrahedralCoords[2 * LUT_NUM_TETRAHEDRONS];
+float4x4       LutTetrahedralMatrices[LUT_NUM_TETRAHEDRONS];
+float          LUTInterp;
+
+float4x4       CLEDToneMapMatrix;
+float          ToneMapperGammaSelect;
+float2         BorderTopLeft;
+float2         BorderBtmRight;
+float2         FrameLineTopLeft;
+float2         FrameLineBtmRight;
+float2         VCamBorderTopLeft;
+float2         VCamBorderBtmRight;
+float2         RandomNoiseUVOffset;
+int            bShowOnScreenDisplay;
+int            bShowLogo;
+int            bEnableNoiseSimulation;
+float          FrameLineMaskAlpha;
+float          SensorAspectRatio;
+float2         LogoScale;
+float2         LogoPos;
+int            bApplyELZone;
+
+
+/*=============================================================================*/
+
+#include "SonyCommonFunctions.ush"
+
+// ============================================================================================================================
+
+// ST2084 (PQ) constants
+static const float st2084_m1 = 1305.0f/8192.0f;
+static const float st2084_m2 = 2523.0f/32.0f;
+static const float st2084_c1 = 107.0f/128.0f;
+static const float st2084_c2 = 2413.0f/128.0f;
+static const float st2084_c3 = 2392.0f/128.0f;
+
+float4 ST2084Gamma(float4 InputColor)
+{
+    float4 refInputColor = max(0.01f * InputColor, 0.0f);
+    float4 powerColor = pow(refInputColor, st2084_m1);
+    float4 fracColor = ((st2084_c1 + st2084_c2 * powerColor) / (1.0f + st2084_c3 * powerColor));
+    return pow(fracColor, st2084_m2);
+}
+
+float4 ST2084InvGamma(float4 InputColor)
+{
+    float4 powerColor = pow(max(InputColor, 0.0f), 1.0f/st2084_m2);
+    float4 numColor = max(powerColor - st2084_c1, 0.0f);
+    float4 denomColor = st2084_c2 - (powerColor * st2084_c3);
+    return 100.0f * pow(max(numColor / denomColor, 0.0f), 1.0f/st2084_m1);
+}
+
+// ============================================================================================================================
+
+// S-Log3 constants
+static const float slog3_grayValue = 0.18f;
+static const float slog3_grayCode = 420.0f;
+static const float slog3_blackCode = 95.0f;
+static const float slog3_normalizeGain10Bits = 1023.0f;
+static const float slog3_offset0 = 0.01125000f;
+static const float slog3_offset1 = 0.01f;
+static const float slog3_offset2 = 171.2102946929f;
+static const float slog3_gain0 = 261.5f;
+static const float kReflection = 0.9f;
+
+float4 SLog3Gamma(float4 InputColor)
+{
+    float4 refInputColor = kReflection * InputColor;
+    float4 select = step(slog3_offset0, refInputColor); 
+    float4 outputColorHigh = (slog3_grayCode + slog3_gain0 * log10((refInputColor + slog3_offset1) / (slog3_grayValue + slog3_offset1))) / slog3_normalizeGain10Bits;
+    float4 outputColorLow = (refInputColor * (slog3_offset2 - slog3_blackCode) / slog3_offset0 + slog3_blackCode) / slog3_normalizeGain10Bits;
+
+    return lerp(outputColorLow, outputColorHigh, select);
+}
+
+float4 SLog3InvGamma(float4 InputColor)
+{
+    float4 select = step(slog3_offset2 / slog3_normalizeGain10Bits, InputColor); 
+    float4 outputColorHigh = pow(10.0f, (InputColor * slog3_normalizeGain10Bits - slog3_grayCode) / slog3_gain0) * (slog3_grayValue + slog3_offset1) - slog3_offset1;
+    float4 outputColorLow = (InputColor * slog3_normalizeGain10Bits - slog3_blackCode) * slog3_offset0 / (slog3_offset2 - slog3_blackCode);
+
+    return lerp(outputColorLow, outputColorHigh, select) / kReflection;
+}
+
+// ============================================================================================================================
+
+float4 InputToneMapper(float4 InputColor)
+{
+    float4 matColor = mul(InputColor, CLEDToneMapMatrix);
+    if(ToneMapperGammaSelect < 0.5f)
+    {
+        return matColor;
+    }
+    else if(ToneMapperGammaSelect < 1.5f)
+    {
+        return pow(max(matColor, 0.0f), 1.0f/2.2f);
+    }
+    else if(ToneMapperGammaSelect < 2.5f)
+    {
+        return pow(max(matColor, 0.0f), 1.0f/2.4f);
+    }
+    else
+    {
+        return ST2084Gamma(matColor);
+    }
+}
+
+
+/* Pixel shader
+=============================================================================*/
+
+void SonyVirtualCameraMainPS(float4 InPosition : SV_POSITION,
+    float4 InUV : TEXCOORD0,
+    out float4 OutColor : SV_Target0)
+{
+    float2 TexSize;
+    InputTexture.GetDimensions(TexSize.x, TexSize.y);
+    
+    float ScaleForOSD = 1.0f / (1.0f - 2.0f * VCamBorderTopLeft.y);
+    float2 GfxTexSize;
+    ViewfinderGraphicsTexture.GetDimensions(GfxTexSize.x, GfxTexSize.y);
+    float ScaleForBorder = bShowOnScreenDisplay ? 1.0f / (BorderBtmRight.y - BorderTopLeft.y) : 1.0f;
+    
+    float2 scaledCoords = ScaleForBorder * InUV.zw;
+
+    float radius_mm = SensorAspectRatio * SensorHeightmm * 0.5f * length(ViewportSize.xy * scaledCoords) / ViewportSize.x;
+    float2 LensData = LensTexture.Sample(LensTextureSampler, float2(radius_mm/SensorMaxRadiusmm, 0.0f));
+    float radialDistortion = LensData.x;
+    float2 CentreOffset = 0.5f*ViewportSize.xy/TexSize.xy;
+    float2 newTexCoord = float2(0.5f, -0.5f) * radialDistortion * scaledCoords * ViewportSize.xy / TexSize.xy + CentreOffset;
+    float4 InputColor = LensData.y * InputTexture.Sample(InputTextureSampler, newTexCoord);
+
+    float viewportAspectRatio = ViewportSize.y/(float)ViewportSize.x;
+    float2 pos = ScaleForOSD * 0.5f * float2(1.0f, SensorAspectRatio * viewportAspectRatio) * InUV.zw + float2(0.5f, 0.5f);
+    float gfxAspectRatio = GfxTexSize.y / GfxTexSize.x;
+    float2 gfxTexCoords;
+    gfxTexCoords.x = pos.x * SensorAspectRatio * gfxAspectRatio;
+    gfxTexCoords.y = 1.0f - pos.y;
+
+    float2 logoTexCoords = float2(1.0f, viewportAspectRatio) * scaledCoords - LogoPos;
+    logoTexCoords /= 2.0f * LogoScale;
+    logoTexCoords.y = 1.0f - logoTexCoords.y;
+ 
+    float4 VfGfxColor = ViewfinderGraphicsTexture.Sample(ViewfinderGraphicsTextureSampler, gfxTexCoords);
+    float4 LogoColor = LogoTexture.Sample(LogoTextureSampler, logoTexCoords);
+
+    float4 ToneMapColor = InputToneMapper(InputColor);
+    float4 CameraPreNoiseColor = Apply3DLUT(ToneMapColor, 0.0f, LUTInterp, PreNoiseLutTexture, PreNoiseLutTextureSampler);
+
+    float4 NoiseColor = CameraPreNoiseColor;
+
+    if (bEnableNoiseSimulation)
+    {
+        float2 noiseTexCoords = gfxTexCoords + RandomNoiseUVOffset;
+        float4 NoiseTexColor = NoiseTexture.Sample(NoiseTextureSampler, noiseTexCoords);
+        NoiseColor = SLog3InvGamma(NoiseColor);
+        NoiseColor.rgb += NoiseTexColor.rgb;
+        NoiseColor = max(SLog3Gamma(NoiseColor), 0.0f);
+    }
+
+    float4 CameraOutColor = Apply3DLUT(NoiseColor, 0.0f, LUTInterp, PostNoiseLutTexture, PostNoiseLutTextureSampler);
+
+    if(bApplyELZone)
+    {
+	     float3 ELZoneCol = CameraOutColor.rgb; 
+	     float Luminance = 2*(log2(10*ELZoneCol.r) + 7); 
+
+	     int3 ELZoneCoords = clamp(int3(floor(Luminance), 0, 0), 0, 29); 
+        CameraOutColor = ELZoneTextureSP.Load(ELZoneCoords);
+        if(ELZoneCol.g > 1.0f)
+        {
+            CameraOutColor = float4(1.0f, 1.0f, 1.0f, 1.0f);
+        }
+    }
+
+	 float4 OuterBorderColor = float4(0.25f, 0.25f, 0.25f, 1.0f);
+
+    if (bShowOnScreenDisplay)
+    {
+        if (any(pos < 0) || any(pos > 1))
+        {
+            OutColor = OuterBorderColor;
+        }
+		 else if (any(gfxTexCoords.xy < BorderTopLeft) || any(gfxTexCoords.xy > BorderBtmRight))
+        {
+            OutColor = VfGfxColor;
+        }
+        else
+        {
+            if (VfGfxColor.a < 1.f && (any(gfxTexCoords.xy < FrameLineTopLeft) || any(gfxTexCoords.xy > FrameLineBtmRight)))
+            {
+                OutColor = float4(lerp(CameraOutColor.xyz, float3(0.0f, 0.0f, 0.0f), FrameLineMaskAlpha), 1.0f);
+            }
+            else
+            {
+                OutColor = float4(lerp(CameraOutColor.xyz, VfGfxColor.xyz, VfGfxColor.a), 1.0f);
+            }
+        }
+    }
+    else
+    {
+         OutColor = float4(lerp(CameraOutColor.xyz, VfGfxColor.xyz, VfGfxColor.a), 1.0f);
+    }
+    if (bShowLogo)
+    {
+         OutColor = float4(lerp(OutColor.xyz, LogoColor.xyz, LogoColor.a), 1.0f);
+    }
+}
